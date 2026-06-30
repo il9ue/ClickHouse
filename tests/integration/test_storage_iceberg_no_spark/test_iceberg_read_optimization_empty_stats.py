@@ -1,38 +1,11 @@
 #!/usr/bin/env python3
 """
-Reproducer for Altinity/ClickHouse#1545:
-icebergLocal() returns all-NULL columns when allow_experimental_iceberg_read_optimization=1
-and the Iceberg manifest has no column statistics.
-
-Root cause
-----------
-The manifest Avro writer schema intentionally omits the optional stats fields
-(value_counts, column_sizes, null_value_counts, lower_bounds, upper_bounds).
-AvroForIcebergDeserializer.hasPath() therefore returns false for all three stats
-paths in ManifestFile.cpp.  columns_infos is left empty.
-
-StorageObjectStorageSource::createReader's second loop (the schema-evolution
-"absent column as NULL" path) iterates over every requested column.  Because
-columns_infos is empty, every nullable column is absent → each is injected as a
-constant NULL.  With all requested columns constant, need_only_count is set to
-true and the Parquet file is read in count-only mode; the output is the correct
-number of rows, but every value is NULL.
-
-Tests
------
-- test_iceberg_local_returns_actual_rows_with_stats_less_manifest
-  FAILS on unpatched code: returns all-NULL rows instead of real data.
-
-- test_iceberg_local_returns_correct_rows_when_optimization_disabled
-  PASSES on unpatched code: regression guard — optimization=0 bypasses the
-  buggy path and reads the Parquet file normally.
+Regression coverage for Altinity/ClickHouse#1545.
 """
-
 import json
 import os
 import tempfile
 import time
-import uuid
 
 import avro.datafile
 import avro.io
@@ -42,69 +15,33 @@ import pyarrow.parquet as pq
 
 from helpers.iceberg_utils import get_uuid_str
 from helpers.s3_tools import LocalUploader
+from helpers.iceberg_avro_schemas import (
+    MANIFEST_LIST_SCHEMA_STR,
+    MANIFEST_ENTRY_NO_STATS_SCHEMA_STR,
+)
+
+_IDS = [1, 2, 3]
+_DATA = ["hello", "world", "iceberg"]
+_REAL_DATA_RESULT = "1\thello\n2\tworld\n3\ticeberg"
+_DATA_NULL_RESULT = "1\t\\N\n2\t\\N\n3\t\\N"
+_TABLE_UUID = "01234567-89ab-cdef-0123-456789abcdef"
+
+def _schema_fields(with_data):
+    fields = [{"id": 1, "name": "id", "required": False, "type": "int"}]
+    if with_data:
+        fields.append({"id": 2, "name": "data", "required": False, "type": "string"})
+    return fields
 
 
-# Iceberg v2 manifest list Avro schema (minimal fields needed by ClickHouse).
-_MANIFEST_LIST_SCHEMA_STR = json.dumps({
-    "type": "record",
-    "name": "manifest_file",
-    "fields": [
-        {"name": "manifest_path",        "type": "string"},
-        {"name": "manifest_length",      "type": "long"},
-        {"name": "partition_spec_id",    "type": "int"},
-        {"name": "content",              "type": "int"},
-        {"name": "sequence_number",      "type": "long"},
-        {"name": "min_sequence_number",  "type": "long"},
-        {"name": "added_snapshot_id",    "type": "long"},
-        {"name": "added_files_count",    "type": "int"},
-        {"name": "existing_files_count", "type": "int"},
-        {"name": "deleted_files_count",  "type": "int"},
-        {"name": "added_rows_count",     "type": "long"},
-        {"name": "existing_rows_count",  "type": "long"},
-        {"name": "deleted_rows_count",   "type": "long"},
-    ],
-})
-
-# Manifest entry Avro schema that deliberately omits all per-column stats fields:
-#   column_sizes, value_counts, null_value_counts, lower_bounds, upper_bounds.
-#
-# Absent fields → AvroForIcebergDeserializer.hasPath() returns false for each →
-# ManifestFile.cpp skips stats collection → columns_infos is empty →
-# the optimization treats every nullable column as a "schema-evolution absent column"
-# and injects a constant NULL.
-_MANIFEST_ENTRY_NO_STATS_SCHEMA_STR = json.dumps({
-    "type": "record",
-    "name": "manifest_entry",
-    "fields": [
-        {"name": "status",               "type": "int"},
-        {"name": "snapshot_id",          "type": ["null", "long"]},
-        {"name": "sequence_number",      "type": ["null", "long"]},
-        {"name": "file_sequence_number", "type": ["null", "long"]},
-        {
-            "name": "data_file",
-            "type": {
-                "type": "record",
-                "name": "r2",
-                "fields": [
-                    {"name": "content",            "type": "int"},
-                    {"name": "file_path",          "type": "string"},
-                    {"name": "file_format",        "type": "string"},
-                    {
-                        "name": "partition",
-                        "type": {"type": "record", "name": "r102", "fields": []},
-                    },
-                    {"name": "record_count",       "type": "long"},
-                    {"name": "file_size_in_bytes", "type": "long"},
-                ],
-            },
-        },
-    ],
-})
+def _iceberg_schema(schema_id, with_data):
+    return {"type": "struct", "schema-id": schema_id, "fields": _schema_fields(with_data)}
 
 
-def _write_avro(schema, records, path, metadata=None):
+def _write_avro(schema_str, records, path, metadata=None):
     with open(path, "wb") as f:
-        writer = avro.datafile.DataFileWriter(f, avro.io.DatumWriter(), schema)
+        writer = avro.datafile.DataFileWriter(
+            f, avro.io.DatumWriter(), avro.schema.parse(schema_str)
+        )
         if metadata:
             for k, v in metadata.items():
                 writer.set_meta(k, v if isinstance(v, bytes) else v.encode("utf-8"))
@@ -113,17 +50,16 @@ def _write_avro(schema, records, path, metadata=None):
         writer.close()
 
 
-def _create_stats_less_iceberg_table(tmpdir, table_name, container_base):
+def _create_iceberg_table(
+    tmpdir,
+    table_name,
+    container_base,
+    *,
+    file_has_data_column=True,
+    schema_evolution=False,
+):
     """
-    Build a minimal Iceberg v2 table under tmpdir/table_name.  The manifest is
-    written with a stats-less Avro schema to trigger the optimization bug.
-
-    container_base is the absolute path inside the ClickHouse container where the
-    table will be placed after upload.  File paths embedded in the Avro records and
-    metadata.json must reference container_base because they are interpreted at
-    query time inside the container.
-
-    Returns the local table directory path (tmpdir/table_name).
+    Build a minimal stats-less Iceberg v2 table under ``tmpdir/table_name``.
     """
     table_local = os.path.join(tmpdir, table_name)
     data_local  = os.path.join(table_local, "data")
@@ -131,125 +67,130 @@ def _create_stats_less_iceberg_table(tmpdir, table_name, container_base):
     os.makedirs(data_local)
     os.makedirs(meta_local)
 
-    # Parquet data file with two nullable columns.
-    arrow_schema = pa.schema([
-        pa.field("id",   pa.int32(),  nullable=True),
-        pa.field("data", pa.string(), nullable=True),
-    ])
+    arrow_fields = [pa.field("id", pa.int32(), nullable=True)]
+    table_data = {"id": pa.array(_IDS, type=pa.int32())}
+    if file_has_data_column:
+        arrow_fields.append(pa.field("data", pa.string(), nullable=True))
+        table_data["data"] = pa.array(_DATA, type=pa.string())
     pq.write_table(
-        pa.table(
-            {
-                "id":   pa.array([1, 2, 3], type=pa.int32()),
-                "data": pa.array(["hello", "world", "iceberg"], type=pa.string()),
-            },
-            schema=arrow_schema,
-        ),
+        pa.table(table_data, schema=pa.schema(arrow_fields)),
         os.path.join(data_local, "00000-0-data.parquet"),
     )
     data_size           = os.path.getsize(os.path.join(data_local, "00000-0-data.parquet"))
     data_container_path = f"{container_base}/data/00000-0-data.parquet"
 
-    snapshot_id = 1
-    seq_number  = 1
-    ts_ms       = int(time.time() * 1000)
+    ts_ms = int(time.time() * 1000)
 
-    # Iceberg schema and partition-spec to embed as Avro file-level metadata.
-    # ManifestFile.cpp requires both keys to be present in the manifest's Avro header.
-    iceberg_schema = {
-        "type": "struct",
-        "schema-id": 0,
-        "fields": [
-            {"id": 1, "name": "id",   "required": False, "type": "int"},
-            {"id": 2, "name": "data", "required": False, "type": "string"},
-        ],
+    # snapshot_id is the snapshot that wrote the file. Under schema evolution it
+    # carries the older schema (0) while the table reads at schema 1, which makes
+    # getInitialSchemaByPath return the file's own schema as initial_header.
+    entry_snapshot_id = 1
+    write_schema_id   = 0
+
+    data_file_record = {
+        "content":            0,            # DATA
+        "file_path":          data_container_path,
+        "file_format":        "PARQUET",
+        "partition":          {},
+        "record_count":       len(_IDS),
+        "file_size_in_bytes": data_size,
     }
 
-    # Manifest file (stats-less Avro schema).
     manifest_local_path     = os.path.join(meta_local, "00000-0-manifest.avro")
     manifest_container_path = f"{container_base}/metadata/00000-0-manifest.avro"
     _write_avro(
-        avro.schema.parse(_MANIFEST_ENTRY_NO_STATS_SCHEMA_STR),
+        MANIFEST_ENTRY_NO_STATS_SCHEMA_STR,
         [{
             "status":               1,             # ADDED
-            "snapshot_id":          snapshot_id,
-            "sequence_number":      seq_number,
-            "file_sequence_number": seq_number,
-            "data_file": {
-                "content":            0,            # DATA
-                "file_path":          data_container_path,
-                "file_format":        "PARQUET",
-                "partition":          {},
-                "record_count":       3,
-                "file_size_in_bytes": data_size,
-            },
+            "snapshot_id":          entry_snapshot_id,
+            "sequence_number":      1,
+            "file_sequence_number": 1,
+            "data_file":            data_file_record,
         }],
         manifest_local_path,
         metadata={
-            "schema":         json.dumps(iceberg_schema),
+            # Manifest's own schema = the data file's write schema.
+            "schema":         json.dumps(_iceberg_schema(write_schema_id, file_has_data_column)),
             "partition-spec": "[]",
         },
     )
     manifest_size = os.path.getsize(manifest_local_path)
 
-    # Manifest list.
-    mlist_filename      = f"snap-{snapshot_id}-0-manifest-list.avro"
-    mlist_local_path    = os.path.join(meta_local, mlist_filename)
-    mlist_container_path = f"{container_base}/metadata/{mlist_filename}"
-    _write_avro(
-        avro.schema.parse(_MANIFEST_LIST_SCHEMA_STR),
-        [{
-            "manifest_path":        manifest_container_path,
-            "manifest_length":      manifest_size,
-            "partition_spec_id":    0,
-            "content":              0,             # DATA
-            "sequence_number":      seq_number,
-            "min_sequence_number":  seq_number,
-            "added_snapshot_id":    snapshot_id,
-            "added_files_count":    1,
-            "existing_files_count": 0,
-            "deleted_files_count":  0,
-            "added_rows_count":     3,
-            "existing_rows_count":  0,
-            "deleted_rows_count":   0,
-        }],
-        mlist_local_path,
-    )
+    def _write_manifest_list(snapshot_id):
+        filename       = f"snap-{snapshot_id}-0-manifest-list.avro"
+        local_path     = os.path.join(meta_local, filename)
+        container_path = f"{container_base}/metadata/{filename}"
+        _write_avro(
+            MANIFEST_LIST_SCHEMA_STR,
+            [{
+                "manifest_path":        manifest_container_path,
+                "manifest_length":      manifest_size,
+                "partition_spec_id":    0,
+                "content":              0,             # DATA
+                "sequence_number":      1,
+                "min_sequence_number":  1,
+                "added_snapshot_id":    entry_snapshot_id,
+                "added_files_count":    1,
+                "existing_files_count": 0,
+                "deleted_files_count":  0,
+                "added_rows_count":     len(_IDS),
+                "existing_rows_count":  0,
+                "deleted_rows_count":   0,
+            }],
+            local_path,
+        )
+        return container_path
 
-    # Table metadata JSON.
+    if schema_evolution:
+        # Written under schema 0 (id only), later evolved to schema 1 (id+data).
+        schemas          = [_iceberg_schema(0, with_data=False), _iceberg_schema(1, with_data=True)]
+        current_schema   = 1
+        snapshots = [
+            {"snapshot-id": 1, "schema-id": 0, "manifest-list": _write_manifest_list(1)},
+            {"snapshot-id": 2, "schema-id": 1, "manifest-list": _write_manifest_list(2)},
+        ]
+        current_snapshot = 2
+        last_seq         = 2
+    else:
+        # Single schema (id+data)
+        schemas          = [_iceberg_schema(0, with_data=True)]
+        current_schema   = 0
+        snapshots = [
+            {"snapshot-id": 1, "schema-id": 0, "manifest-list": _write_manifest_list(1)},
+        ]
+        current_snapshot = 1
+        last_seq         = 1
+
     metadata = {
         "format-version":       2,
-        "table-uuid":           str(uuid.uuid4()),
+        "table-uuid":           _TABLE_UUID,
         "location":             container_base,
-        "last-sequence-number": seq_number,
+        "last-sequence-number": last_seq,
         "last-updated-ms":      ts_ms,
         "last-column-id":       2,
-        "current-schema-id":    0,
-        "schemas": [{
-            "type":      "struct",
-            "schema-id": 0,
-            "fields": [
-                {"id": 1, "name": "id",   "required": False, "type": "int"},
-                {"id": 2, "name": "data", "required": False, "type": "string"},
-            ],
-        }],
+        "current-schema-id":    current_schema,
+        "schemas":              schemas,
         "default-spec-id":       0,
         "partition-specs":       [{"spec-id": 0, "fields": []}],
         "last-partition-id":     999,
         "default-sort-order-id": 0,
         "sort-orders":           [{"order-id": 0, "fields": []}],
         "properties":            {},
-        "current-snapshot-id":   snapshot_id,
-        "snapshots": [{
-            "snapshot-id":    snapshot_id,
-            "sequence-number": seq_number,
-            "timestamp-ms":   ts_ms,
-            "manifest-list":  mlist_container_path,
-            "summary":        {"operation": "append"},
-            "schema-id":      0,
-        }],
-        "snapshot-log": [{"timestamp-ms": ts_ms, "snapshot-id": snapshot_id}],
+        "current-snapshot-id":   current_snapshot,
+        "snapshots": [
+            {
+                "snapshot-id":     s["snapshot-id"],
+                "sequence-number": s["snapshot-id"],
+                "timestamp-ms":    ts_ms,
+                "manifest-list":   s["manifest-list"],
+                "summary":         {"operation": "append"},
+                "schema-id":       s["schema-id"],
+            }
+            for s in snapshots
+        ],
+        "snapshot-log": [{"timestamp-ms": ts_ms, "snapshot-id": s["snapshot-id"]} for s in snapshots],
         "metadata-log":  [],
-        "refs":          {"main": {"snapshot-id": snapshot_id, "type": "branch"}},
+        "refs":          {"main": {"snapshot-id": current_snapshot, "type": "branch"}},
     }
     with open(os.path.join(meta_local, "v1.metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
@@ -257,7 +198,7 @@ def _create_stats_less_iceberg_table(tmpdir, table_name, container_base):
     return table_local
 
 
-def _upload_to_container(instance, local_table_dir, container_base):
+def _upload_to_node(instance, local_table_dir, container_base):
     uploader = LocalUploader(instance)
     for root, _dirs, files in os.walk(local_table_dir):
         for fname in files:
@@ -266,420 +207,90 @@ def _upload_to_container(instance, local_table_dir, container_base):
             uploader.upload_file(local_path, os.path.join(container_base, rel))
 
 
-# Manifest entry schema with value_counts only (partial stats).
-# column_sizes and null_value_counts are absent.  value_counts alone is enough to
-# populate columns_info so the absent-NULL guard (columns_info.empty()) is not triggered.
-_MANIFEST_ENTRY_PARTIAL_STATS_SCHEMA_STR = json.dumps({
-    "type": "record",
-    "name": "manifest_entry",
-    "fields": [
-        {"name": "status",               "type": "int"},
-        {"name": "snapshot_id",          "type": ["null", "long"]},
-        {"name": "sequence_number",      "type": ["null", "long"]},
-        {"name": "file_sequence_number", "type": ["null", "long"]},
-        {
-            "name": "data_file",
-            "type": {
-                "type": "record",
-                "name": "r2",
-                "fields": [
-                    {"name": "content",            "type": "int"},
-                    {"name": "file_path",          "type": "string"},
-                    {"name": "file_format",        "type": "string"},
-                    {
-                        "name": "partition",
-                        "type": {"type": "record", "name": "r102", "fields": []},
-                    },
-                    {"name": "record_count",       "type": "long"},
-                    {"name": "file_size_in_bytes", "type": "long"},
-                    # Only value_counts is present (column_sizes and null_value_counts absent).
-                    {
-                        "name": "value_counts",
-                        "type": {
-                            "type": "array",
-                            "items": {
-                                "type": "record",
-                                "name": "k81v81",
-                                "fields": [
-                                    {"name": "key",   "type": "int"},
-                                    {"name": "value", "type": "long"},
-                                ],
-                            },
-                        },
-                    },
-                ],
-            },
-        },
-    ],
-})
-
-# Manifest entry schema with all three stats fields (value_counts, column_sizes,
-# null_value_counts).  Represents a manifest written by a full-stats writer such as Spark.
-_MANIFEST_ENTRY_FULL_STATS_SCHEMA_STR = json.dumps({
-    "type": "record",
-    "name": "manifest_entry",
-    "fields": [
-        {"name": "status",               "type": "int"},
-        {"name": "snapshot_id",          "type": ["null", "long"]},
-        {"name": "sequence_number",      "type": ["null", "long"]},
-        {"name": "file_sequence_number", "type": ["null", "long"]},
-        {
-            "name": "data_file",
-            "type": {
-                "type": "record",
-                "name": "r2",
-                "fields": [
-                    {"name": "content",            "type": "int"},
-                    {"name": "file_path",          "type": "string"},
-                    {"name": "file_format",        "type": "string"},
-                    {
-                        "name": "partition",
-                        "type": {"type": "record", "name": "r102", "fields": []},
-                    },
-                    {"name": "record_count",       "type": "long"},
-                    {"name": "file_size_in_bytes", "type": "long"},
-                    {
-                        "name": "column_sizes",
-                        "type": {
-                            "type": "array",
-                            "items": {
-                                "type": "record",
-                                "name": "k81v81",
-                                "fields": [
-                                    {"name": "key",   "type": "int"},
-                                    {"name": "value", "type": "long"},
-                                ],
-                            },
-                        },
-                    },
-                    {
-                        "name": "value_counts",
-                        "type": {
-                            "type": "array",
-                            "items": {
-                                "type": "record",
-                                "name": "k81v81_vc",
-                                "fields": [
-                                    {"name": "key",   "type": "int"},
-                                    {"name": "value", "type": "long"},
-                                ],
-                            },
-                        },
-                    },
-                    {
-                        "name": "null_value_counts",
-                        "type": {
-                            "type": "array",
-                            "items": {
-                                "type": "record",
-                                "name": "k81v81_nc",
-                                "fields": [
-                                    {"name": "key",   "type": "int"},
-                                    {"name": "value", "type": "long"},
-                                ],
-                            },
-                        },
-                    },
-                ],
-            },
-        },
-    ],
-})
+def _container_base(table_name):
+    return f"/var/lib/clickhouse/user_files/iceberg_data/default/{table_name}"
 
 
-def _create_iceberg_table_with_schema(tmpdir, table_name, container_base,
-                                      manifest_schema_str, manifest_extra_fields=None):
-    """
-    Build a minimal Iceberg v2 table.  manifest_extra_fields is added to each
-    manifest entry's data_file record when using schemas that include stats.
-    """
-    table_local = os.path.join(tmpdir, table_name)
-    data_local  = os.path.join(table_local, "data")
-    meta_local  = os.path.join(table_local, "metadata")
-    os.makedirs(data_local)
-    os.makedirs(meta_local)
-
-    arrow_schema = pa.schema([
-        pa.field("id",   pa.int32(),  nullable=True),
-        pa.field("data", pa.string(), nullable=True),
-    ])
-    pq.write_table(
-        pa.table(
-            {
-                "id":   pa.array([1, 2, 3], type=pa.int32()),
-                "data": pa.array(["hello", "world", "iceberg"], type=pa.string()),
-            },
-            schema=arrow_schema,
-        ),
-        os.path.join(data_local, "00000-0-data.parquet"),
-    )
-    data_size           = os.path.getsize(os.path.join(data_local, "00000-0-data.parquet"))
-    data_container_path = f"{container_base}/data/00000-0-data.parquet"
-
-    snapshot_id = 1
-    seq_number  = 1
-    ts_ms       = int(time.time() * 1000)
-
-    iceberg_schema = {
-        "type": "struct",
-        "schema-id": 0,
-        "fields": [
-            {"id": 1, "name": "id",   "required": False, "type": "int"},
-            {"id": 2, "name": "data", "required": False, "type": "string"},
-        ],
-    }
-
-    data_file_record = {
-        "content":            0,
-        "file_path":          data_container_path,
-        "file_format":        "PARQUET",
-        "partition":          {},
-        "record_count":       3,
-        "file_size_in_bytes": data_size,
-    }
-    if manifest_extra_fields:
-        data_file_record.update(manifest_extra_fields)
-
-    manifest_local_path     = os.path.join(meta_local, "00000-0-manifest.avro")
-    manifest_container_path = f"{container_base}/metadata/00000-0-manifest.avro"
-    _write_avro(
-        avro.schema.parse(manifest_schema_str),
-        [{
-            "status":               1,
-            "snapshot_id":          snapshot_id,
-            "sequence_number":      seq_number,
-            "file_sequence_number": seq_number,
-            "data_file":            data_file_record,
-        }],
-        manifest_local_path,
-        metadata={
-            "schema":         json.dumps(iceberg_schema),
-            "partition-spec": "[]",
-        },
-    )
-    manifest_size = os.path.getsize(manifest_local_path)
-
-    mlist_filename       = f"snap-{snapshot_id}-0-manifest-list.avro"
-    mlist_local_path     = os.path.join(meta_local, mlist_filename)
-    mlist_container_path = f"{container_base}/metadata/{mlist_filename}"
-    _write_avro(
-        avro.schema.parse(_MANIFEST_LIST_SCHEMA_STR),
-        [{
-            "manifest_path":        manifest_container_path,
-            "manifest_length":      manifest_size,
-            "partition_spec_id":    0,
-            "content":              0,
-            "sequence_number":      seq_number,
-            "min_sequence_number":  seq_number,
-            "added_snapshot_id":    snapshot_id,
-            "added_files_count":    1,
-            "existing_files_count": 0,
-            "deleted_files_count":  0,
-            "added_rows_count":     3,
-            "existing_rows_count":  0,
-            "deleted_rows_count":   0,
-        }],
-        mlist_local_path,
-    )
-
-    metadata = {
-        "format-version":       2,
-        "table-uuid":           str(uuid.uuid4()),
-        "location":             container_base,
-        "last-sequence-number": seq_number,
-        "last-updated-ms":      ts_ms,
-        "last-column-id":       2,
-        "current-schema-id":    0,
-        "schemas": [{
-            "type":      "struct",
-            "schema-id": 0,
-            "fields": [
-                {"id": 1, "name": "id",   "required": False, "type": "int"},
-                {"id": 2, "name": "data", "required": False, "type": "string"},
-            ],
-        }],
-        "default-spec-id":       0,
-        "partition-specs":       [{"spec-id": 0, "fields": []}],
-        "last-partition-id":     999,
-        "default-sort-order-id": 0,
-        "sort-orders":           [{"order-id": 0, "fields": []}],
-        "properties":            {},
-        "current-snapshot-id":   snapshot_id,
-        "snapshots": [{
-            "snapshot-id":    snapshot_id,
-            "sequence-number": seq_number,
-            "timestamp-ms":   ts_ms,
-            "manifest-list":  mlist_container_path,
-            "summary":        {"operation": "append"},
-            "schema-id":      0,
-        }],
-        "snapshot-log": [{"timestamp-ms": ts_ms, "snapshot-id": snapshot_id}],
-        "metadata-log":  [],
-        "refs":          {"main": {"snapshot-id": snapshot_id, "type": "branch"}},
-    }
-    with open(os.path.join(meta_local, "v1.metadata.json"), "w") as f:
-        json.dump(metadata, f, indent=2)
-
-    return table_local
-
-
-def test_iceberg_local_returns_actual_rows_with_stats_less_manifest(
-    started_cluster_iceberg_no_spark,
-):
-    """
-    FAILS on unpatched code (Altinity#1545).
-
-    With allow_experimental_iceberg_read_optimization=1 (the default), reading an
-    icebergLocal table whose manifest omits column statistics returns all-NULL rows
-    instead of real data.  The correct output is 3 rows: (1,'hello'), (2,'world'),
-    (3,'iceberg').
-    """
-    instance   = started_cluster_iceberg_no_spark.instances["node1"]
-    table_name = "test_opt_on_stats_less_" + get_uuid_str()
-    container_base = (
-        f"/var/lib/clickhouse/user_files/iceberg_data/default/{table_name}"
-    )
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        local_dir = _create_stats_less_iceberg_table(tmpdir, table_name, container_base)
-        _upload_to_container(instance, local_dir, container_base)
-
-    result = instance.query(
+def _query_local(instance, container_base, optimization=1):
+    return instance.query(
         f"SELECT * FROM icebergLocal(local, path='{container_base}', format=Parquet)"
         " ORDER BY id"
-        " SETTINGS allow_experimental_iceberg_read_optimization=1"
+        f" SETTINGS allow_experimental_iceberg_read_optimization={optimization}"
     ).strip()
 
-    assert result == "1\thello\n2\tworld\n3\ticeberg", (
-        f"Got: {result!r}\n"
-        "All-NULL rows means the bug fired: empty columns_infos caused the "
-        "optimization to treat every nullable column as an absent schema-evolution "
-        "column and inject constant NULL (need_only_count=1)."
-    )
 
-
-def test_iceberg_local_returns_correct_rows_when_optimization_disabled(
-    started_cluster_iceberg_no_spark,
-):
-    """
-    PASSES on unpatched code.
-
-    With allow_experimental_iceberg_read_optimization=0 the optimization block is
-    skipped entirely and the Parquet file is read normally.  This test is a
-    regression guard: it must keep passing after the bug is fixed.
-    """
-    instance   = started_cluster_iceberg_no_spark.instances["node1"]
-    table_name = "test_opt_off_stats_less_" + get_uuid_str()
-    container_base = (
-        f"/var/lib/clickhouse/user_files/iceberg_data/default/{table_name}"
-    )
+def test_stats_less_manifest_returns_real_data(started_cluster_iceberg_no_spark):
+    instance       = started_cluster_iceberg_no_spark.instances["node1"]
+    table_name     = "test_stats_less_real_" + get_uuid_str()
+    container_base = _container_base(table_name)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        local_dir = _create_stats_less_iceberg_table(tmpdir, table_name, container_base)
-        _upload_to_container(instance, local_dir, container_base)
+        local_dir = _create_iceberg_table(tmpdir, table_name, container_base)
+        _upload_to_node(instance, local_dir, container_base)
 
-    result = instance.query(
-        f"SELECT * FROM icebergLocal(local, path='{container_base}', format=Parquet)"
-        " ORDER BY id"
-        " SETTINGS allow_experimental_iceberg_read_optimization=0"
-    ).strip()
-
-    assert result == "1\thello\n2\tworld\n3\ticeberg"
+    result = _query_local(instance, container_base)
+    assert result == _REAL_DATA_RESULT, f"Got: {result!r}"
 
 
-def test_iceberg_local_partial_stats_manifest_reads_correctly(
-    started_cluster_iceberg_no_spark,
-):
-    """
-    Regression test for Altinity#1545: partial stats (value_counts only).
-
-    A manifest that includes value_counts but omits column_sizes and
-    null_value_counts still populates columns_info.  The fix must treat the
-    columns as real (not absent), so real data is returned.
-    """
-    instance   = started_cluster_iceberg_no_spark.instances["node1"]
-    table_name = "test_opt_on_partial_stats_" + get_uuid_str()
-    container_base = (
-        f"/var/lib/clickhouse/user_files/iceberg_data/default/{table_name}"
-    )
-
-    # value_counts for field_id 1 (id) and 2 (data): 3 rows each.
-    extra = {
-        "value_counts": [
-            {"key": 1, "value": 3},
-            {"key": 2, "value": 3},
-        ],
-    }
+def test_stats_less_manifest_schema_evolution_absent_column(started_cluster_iceberg_no_spark):
+    instance       = started_cluster_iceberg_no_spark.instances["node1"]
+    table_name     = "test_stats_less_evolve_" + get_uuid_str()
+    container_base = _container_base(table_name)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        local_dir = _create_iceberg_table_with_schema(
+        local_dir = _create_iceberg_table(
             tmpdir, table_name, container_base,
-            _MANIFEST_ENTRY_PARTIAL_STATS_SCHEMA_STR,
-            manifest_extra_fields=extra,
+            file_has_data_column=False,
+            schema_evolution=True,
         )
-        _upload_to_container(instance, local_dir, container_base)
+        _upload_to_node(instance, local_dir, container_base)
 
-    result = instance.query(
-        f"SELECT * FROM icebergLocal(local, path='{container_base}', format=Parquet)"
-        " ORDER BY id"
-        " SETTINGS allow_experimental_iceberg_read_optimization=1"
-    ).strip()
-
-    assert result == "1\thello\n2\tworld\n3\ticeberg", (
-        f"Got: {result!r}\n"
-        "Partial-stats manifest (value_counts only) should not trigger the absent-NULL "
-        "path because columns_info is non-empty.  All-NULL rows means the guard "
-        "fired incorrectly for partial-stats manifests."
-    )
+    result = _query_local(instance, container_base)
+    # id NULL too -> empty-stats bug fired; a query error -> the fall-through
+    # failed to synthesize the schema-evolved-absent column.
+    assert result == _DATA_NULL_RESULT, f"Got: {result!r}"
 
 
-def test_iceberg_local_full_stats_manifest_reads_correctly(
-    started_cluster_iceberg_no_spark,
-):
-    """
-    Control test: full-stats manifest (Spark-like) must continue to return real data.
-
-    A manifest with all three stats fields (column_sizes, value_counts,
-    null_value_counts) is the common case written by Spark.  This test verifies the
-    optimization does not regress for the normal path after the fix.
-    """
-    instance   = started_cluster_iceberg_no_spark.instances["node1"]
-    table_name = "test_opt_on_full_stats_" + get_uuid_str()
-    container_base = (
-        f"/var/lib/clickhouse/user_files/iceberg_data/default/{table_name}"
-    )
-
-    # Full stats for field_id 1 (id) and 2 (data).
-    extra = {
-        "column_sizes": [
-            {"key": 1, "value": 64},
-            {"key": 2, "value": 128},
-        ],
-        "value_counts": [
-            {"key": 1, "value": 3},
-            {"key": 2, "value": 3},
-        ],
-        "null_value_counts": [
-            {"key": 1, "value": 0},
-            {"key": 2, "value": 0},
-        ],
-    }
+def test_stats_less_manifest_cluster_returns_real_data(started_cluster_iceberg_no_spark):
+    # Cluster path: empty columns_info must survive the DataFileMetaInfo JSON
+    # round-trip to the worker, not just the single-node read.
+    cluster        = started_cluster_iceberg_no_spark
+    instance       = cluster.instances["node1"]
+    table_name     = "test_stats_less_cluster_" + get_uuid_str()
+    container_base = _container_base(table_name)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        local_dir = _create_iceberg_table_with_schema(
-            tmpdir, table_name, container_base,
-            _MANIFEST_ENTRY_FULL_STATS_SCHEMA_STR,
-            manifest_extra_fields=extra,
-        )
-        _upload_to_container(instance, local_dir, container_base)
+        local_dir = _create_iceberg_table(tmpdir, table_name, container_base)
+        for node in cluster.instances.values():
+            _upload_to_node(node, local_dir, container_base)
 
     result = instance.query(
-        f"SELECT * FROM icebergLocal(local, path='{container_base}', format=Parquet)"
+        f"SELECT * FROM icebergLocalCluster('cluster_simple', local, path='{container_base}', format=Parquet)"
         " ORDER BY id"
         " SETTINGS allow_experimental_iceberg_read_optimization=1"
     ).strip()
+    assert result == _REAL_DATA_RESULT, f"Got: {result!r}"
 
-    assert result == "1\thello\n2\tworld\n3\ticeberg", (
-        f"Got: {result!r}\n"
-        "Full-stats manifest should return real data when optimization is enabled."
+
+def test_mergetree_lasagna_roundtrip(started_cluster_iceberg_no_spark):
+    instance = started_cluster_iceberg_no_spark.instances["node1"]
+    table    = "test_lasagna_" + get_uuid_str()
+
+    instance.query(f"DROP TABLE IF EXISTS {table}")
+    instance.query(
+        f"CREATE TABLE {table} (id Int32, ingredient String) "
+        "ENGINE = MergeTree ORDER BY id"
     )
+
+    ingredients = [
+        "pasta", "tomato", "mozzarella", "basil",
+        "ground beef", "onion", "garlic", "parmesan", "ricotta",
+    ]
+    values = ", ".join(f"({i + 1}, '{ing}')" for i, ing in enumerate(ingredients))
+    instance.query(f"INSERT INTO {table} VALUES {values}")
+
+    result   = instance.query(f"SELECT id, ingredient FROM {table} ORDER BY id").strip()
+    expected = "\n".join(f"{i + 1}\t{ing}" for i, ing in enumerate(ingredients))
+    assert result == expected, f"Got: {result!r}"
+
+    instance.query(f"DROP TABLE IF EXISTS {table}")
